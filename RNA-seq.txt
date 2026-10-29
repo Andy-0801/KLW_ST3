@@ -1,0 +1,296 @@
+### 0.环境设置与加载R包
+setwd("E:/PHD_project/Lys_project/1.project/16.klw/RNAseq/")
+
+library(limma)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(enrichplot)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(patchwork)
+library(scales)
+
+### 1.读入表达数据与limma差异表达分析
+datExpr = read.table(
+  "./caf rna-seq/bmdm_gene_fpkm.txt",
+  header           = TRUE,
+  stringsAsFactors = FALSE,
+  sep              = "\t",
+  row.names        = 1
+)
+
+phenodata = read.table(
+  "./caf rna-seq/bmdm_group_fpkm.txt",
+  header           = TRUE,
+  stringsAsFactors = FALSE,
+  sep              = "\t",
+  row.names        = 1
+)
+
+## 1.1 构建实验设计矩阵与对比模型
+group  = phenodata[, 1]
+design = model.matrix(~ 0 + factor(group))
+rownames(design) = colnames(datExpr)
+colnames(design) = levels(factor(group))
+
+contrast.matrix = makeContrasts("Ctrl-CE", levels = design)
+
+## 1.2 定义并运行limma差异分析函数
+run.limma.deg = function(datExpr, design, contrast.matrix) {
+  fit        = lmFit(datExpr, design)
+  fit2       = contrasts.fit(fit, contrast.matrix)
+  fit2       = eBayes(fit2)
+  tempOutput = topTable(fit2, coef = 1, n = Inf)
+  nrDEG      = na.omit(tempOutput)
+  return(nrDEG)
+}
+
+deg = run.limma.deg(datExpr, design, contrast.matrix)
+
+## 1.3 标记上下调显著性并保存结果
+deg$sig = "no"
+deg$sig[deg$P.Value <= 0.05 & deg$logFC >= 1]  = "up"
+deg$sig[deg$P.Value <= 0.05 & deg$logFC <= -1] = "down"
+
+write.csv(deg, file = "BMDM_rnaseq_group_0.05_1.csv", row.names = TRUE)
+
+### 2.基因ID转换与构建GSEA排序向量 (geneList)
+need_DEG = deg
+need_DEG$ENSEMBL = rownames(need_DEG)
+
+df_map = bitr(
+  need_DEG$ENSEMBL,
+  fromType = "ENSEMBL",
+  toType   = c("SYMBOL", "ENTREZID"),
+  OrgDb    = org.Mm.eg.db,
+  drop     = FALSE
+)
+
+need_DEG2 = merge(need_DEG, df_map, by = "ENSEMBL") %>%
+  filter(!is.na(ENTREZID), !is.na(logFC)) %>%
+  arrange(desc(abs(logFC))) %>%
+  distinct(ENTREZID, .keep_all = TRUE)
+
+geneList = need_DEG2$logFC
+names(geneList) = need_DEG2$ENTREZID
+geneList = sort(geneList, decreasing = TRUE)
+
+### 3.KEGG通路GSEA富集分析与曲线绘制
+## 3.1 运行gseKEGG并转换可读基因名
+KEGG_kk_entrez = gseKEGG(
+  geneList     = geneList,
+  organism     = "mmu",
+  pvalueCutoff = 0.5,
+  minGSSize    = 5,
+  maxGSSize    = 500,
+  verbose      = FALSE
+)
+
+if (!is.null(KEGG_kk_entrez) && nrow(KEGG_kk_entrez@result) > 0) {
+  KEGG_kk = setReadable(
+    KEGG_kk_entrez,
+    OrgDb   = org.Mm.eg.db,
+    keyType = "ENTREZID"
+  )
+  write.csv(KEGG_kk@result, "KEGG_GSEA_result.csv", row.names = FALSE)
+  
+  p.Dot = dotplot(KEGG_kk)
+  ggsave(filename = "KEGG_GSEA_dotplot.pdf", plot = p.Dot, width = 8, height = 6)
+}
+
+## 3.2 单个核心通路 (mmu04142: Lysosome biogenesis) GSEA绘图
+if ("mmu04142" %in% KEGG_kk@result$ID) {
+  stat_lyso = KEGG_kk@result[KEGG_kk@result$ID == "mmu04142", ]
+  p.Lyso = gseaplot2(
+    KEGG_kk,
+    geneSetID   = "mmu04142",
+    title       = paste0(
+      "Lysosome biogenesis\n",
+      "NES = ", round(stat_lyso$NES, 2),
+      ", p = ", signif(stat_lyso$pvalue, 3)
+    ),
+    color        = "red",
+    base_size    = 10,
+    rel_heights  = c(1.5, 0.5, 1),
+    ES_geom      = "line",
+    pvalue_table = TRUE
+  )
+  pdf("GSEA_Lysosome_biogenesis.pdf", width = 7, height = 5)
+  print(p.Lyso)
+  dev.off()
+}
+
+## 3.3 按功能模块分类批量绘制KEGG GSEA曲线
+res_df = KEGG_kk@result
+res_df$pathway_name = gsub(" - Mus musculus.*", "", res_df$Description)
+res_df$group = case_when(
+  res_df$ID %in% c("mmu04610", "mmu04612", "mmu04620", "mmu04640", "mmu04650", "mmu05332", "mmu04940") ~ "Immune suppression",
+  res_df$ID %in% c("mmu04142", "mmu04144", "mmu04145", "mmu04979", "mmu00600", "mmu00531", "mmu00511") ~ "Lysosome / lipid metabolism",
+  res_df$ID %in% c("mmu04010", "mmu04068", "mmu04151", "mmu04141")                                      ~ "ROS / stress",
+  res_df$ID %in% c("mmu04512", "mmu04510", "mmu05205", "mmu04350")                                      ~ "ECM / CAF activation",
+  TRUE                                                                                                   ~ "Other"
+)
+
+plot_df_batch = res_df %>% filter(group != "Other")
+p_col = intersect(c("pvalue", "p.adjust", "qvalue"), colnames(res_df))[1]
+
+for (i in seq_len(nrow(plot_df_batch))) {
+  pw   = plot_df_batch$ID[i]
+  stat = plot_df_batch[i, ]
+  
+  p.Curve = gseaplot2(
+    KEGG_kk,
+    geneSetID = pw,
+    color     = "red",
+    title     = paste0(
+      stat$pathway_name,
+      "\nNES = ", round(stat$NES, 2),
+      ", ", p_col, " = ", signif(stat[[p_col]], 3)
+    )
+  )
+  pdf(paste0("GSEA_", gsub("[/ ]", "_", stat$pathway_name), ".pdf"), width = 7, height = 5)
+  print(p.Curve)
+  dev.off()
+}
+
+### 4.目标KEGG通路NES双向渐变柱状图
+## 4.1 筛选指定通路并提取Top上下调条目
+target_ids = c(
+  "mmu04510", "mmu04620", "mmu04151", "mmu04512", "mmu04350",
+  "mmu04382", "mmu04371", "mmu04060", "mmu04657", "mmu04820",
+  "mmu00600", "mmu04612", "mmu04142", "mmu04979", "mmu04514",
+  "mmu03320", "mmu00561", "mmu00100", "mmu00531"
+)
+
+df_kegg = KEGG_kk@result %>%
+  mutate(
+    Pathway = gsub(" - Mus musculus.*", "", Description),
+    NES     = as.numeric(NES)
+  ) %>%
+  filter(ID %in% target_ids)
+
+up_df   = df_kegg %>% filter(NES > 0) %>% arrange(desc(NES)) %>% slice_head(n = 10)
+down_df = df_kegg %>% filter(NES < 0) %>% arrange(NES) %>% slice_head(n = 10)
+
+plot_df = bind_rows(up_df, down_df) %>%
+  mutate(
+    Direction = ifelse(NES > 0, "Upregulated", "Downregulated"),
+    Pathway   = factor(Pathway, levels = Pathway[order(NES)])
+  )
+
+## 4.2 双向渐变柱状图 (整体排序版)
+p.NES.Bar = ggplot(plot_df, aes(x = NES, y = Pathway, fill = NES)) +
+  geom_bar(stat = "identity", width = 0.75) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.5) +
+  labs(
+    x     = "Normalized Enrichment Score (NES)",
+    y     = NULL,
+    title = "KEGG GSEA: Selected Pathways (Top Up & Down)"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    axis.text.y     = element_text(size = 10),
+    axis.text.x     = element_text(size = 11),
+    legend.position = "right"
+  )
+ggsave(filename = "KEGG_GSEA_Selected_NES_Barplot.pdf", plot = p.NES.Bar, width = 8, height = 6)
+
+## 4.3 上下调独立拼接版 (Up + Down)
+p.Up = ggplot(subset(plot_df, NES > 0), aes(x = NES, y = Pathway, fill = NES)) +
+  geom_bar(stat = "identity", width = 0.75) +
+  scale_fill_gradient(low = "white", high = "#B2182B") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Upregulated pathways", x = "NES", y = NULL) +
+  theme_classic()
+
+p.Down = ggplot(subset(plot_df, NES < 0), aes(x = NES, y = Pathway, fill = NES)) +
+  geom_bar(stat = "identity", width = 0.75) +
+  scale_fill_gradient(low = "#2166AC", high = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Downregulated pathways", x = "NES", y = NULL) +
+  theme_classic()
+
+ggsave(filename = "KEGG_GSEA_Up_Down_Split.pdf", plot = p.Up + p.Down, width = 12, height = 6)
+
+## 4.4 共享坐标轴分面柱状图 (Faceted版)
+p.NES.Facet = ggplot(plot_df, aes(x = NES, y = Pathway, fill = NES)) +
+  geom_bar(stat = "identity", width = 0.75) +
+  scale_fill_gradient2(
+    low      = "#2166AC",
+    mid      = "white",
+    high     = "#B2182B",
+    midpoint = 0,
+    limits   = c(-2, 2),
+    oob      = scales::squish
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  facet_grid(Direction ~ ., scales = "free_y", space = "free_y") +
+  labs(x = "Normalized Enrichment Score (NES)", y = NULL) +
+  theme_classic() +
+  theme(
+    strip.text.y    = element_text(face = "bold"),
+    plot.title      = element_blank(),
+    legend.position = "right",
+    axis.text.y     = element_text(size = 10)
+  )
+ggsave(filename = "KEGG_GSEA_Selected_NES_Facet.pdf", plot = p.NES.Facet, width = 8, height = 6)
+
+### 5.自定义特征基因集 (MET / NET / Macrophage) GSEA富集分析
+## 5.1 定义特征基因集并转换ENTREZID
+NET_signature = c(
+  "S100a8", "S100a9", "Mpo", "Elane", "Padi4", "Camp",
+  "Ltf", "Ngp", "Mmp8", "Mmp9", "Cxcr2"
+)
+
+Macrophage_signature = c(
+  "Adgre1", "Csf1r", "Cd68", "Aif1", "Tyrobp", "C1qa",
+  "C1qb", "C1qc", "Fcgr1", "Mertk", "Lgals3"
+)
+
+MET_signature = unique(c(
+  "Padi4", "Cybb", "Ncf1", "Ncf2", "Rac2", "Mpo", "Elane",
+  "Ctsb", "Ctsd", "Nlrp3", "Casp1", "Il1b", "Tyrobp", "Lyz2", "Aif1", "Hmgb1"
+))
+
+MET_entrez = bitr(
+  MET_signature,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Mm.eg.db
+)
+
+MET_TERM2GENE = data.frame(
+  term = "MET_signature",
+  gene = MET_entrez$ENTREZID
+)
+
+## 5.2 运行自定义MET_signature GSEA与绘图
+MET_GSEA = GSEA(
+  geneList     = geneList,
+  TERM2GENE    = MET_TERM2GENE,
+  pvalueCutoff = 1,
+  minGSSize    = 5,
+  maxGSSize    = 500,
+  verbose      = FALSE
+)
+
+if (!is.null(MET_GSEA) && nrow(MET_GSEA@result) > 0) {
+  MET_res = MET_GSEA@result[MET_GSEA@result$ID == "MET_signature", ]
+  p.MET = gseaplot2(
+    MET_GSEA,
+    geneSetID    = "MET_signature",
+    color        = "red",
+    pvalue_table = TRUE,
+    title        = paste0(
+      "MET signature\n",
+      "NES = ", round(MET_res$NES, 2),
+      ", P = ", signif(MET_res$pvalue, 3)
+    )
+  )
+  pdf("GSEA_MET_signature.pdf", width = 7, height = 5)
+  print(p.MET)
+  dev.off()
+}

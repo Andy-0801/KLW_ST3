@@ -1,0 +1,211 @@
+### 0.环境设置与加载R包
+library(GSVA)
+library(tidyverse)
+library(ggpubr)
+library(survival)
+library(survminer)
+library(timeROC)
+library(cairoDevice)
+
+### 1.路径配置与读取基因集
+root_dir = "E:/PHD_project/Lys_project/1.project/16.klw/BULK_OS"
+
+cohort_names = c(
+  "GSE76427",
+  "GSE54236",
+  "GSE148355",
+  "GSE145202",
+  "GSE144269",
+  "TCGA-LIHC",
+  "ICGC-LIHC",
+  "GSE10141"
+)
+
+gene_file  = "./ST3GAL4_CAF_gene5.txt"
+output_dir = "./ST3GAL4_CAF_results"
+dir.create(output_dir, showWarnings = FALSE)
+
+gene    = read.table(gene_file, header = FALSE, sep = "\t", stringsAsFactors = FALSE)
+go_list = split(gene$V3, gene$V2)
+head(go_list)
+
+### 2.定义单队列GSVA评分、表达比较与预后分析函数
+run.CAF.analysis = function(cohort) {
+  cohort_dir = file.path(root_dir, cohort)
+  exp_file   = file.path(cohort_dir, paste0(cohort, "_exp.txt"))
+  cli_file   = file.path(cohort_dir, paste0(cohort, "_cli.txt"))
+  
+  if (!file.exists(exp_file) | !file.exists(cli_file)) {
+    return(NULL)
+  }
+  
+  ## 2.1 读取与处理表达矩阵
+  exp = read.table(
+    exp_file,
+    header           = TRUE,
+    sep              = "\t",
+    row.names        = 1,
+    check.names      = FALSE,
+    stringsAsFactors = FALSE
+  )
+  exp = exp[!duplicated(rownames(exp)), ]
+  dat = as.matrix(exp)
+  mode(dat) = "numeric"
+  
+  ## 2.2 计算GSVA富集评分并与临床数据对齐
+  gsva_mat = gsva(
+    expr          = dat,
+    gset.idx.list = go_list,
+    kcdf          = "Gaussian",
+    verbose       = FALSE
+  )
+  gsva_df = data.frame(
+    sample = colnames(gsva_mat),
+    t(gsva_mat),
+    check.names = FALSE
+  )
+  
+  cli = read.delim(
+    cli_file,
+    row.names        = 1,
+    check.names      = FALSE,
+    stringsAsFactors = FALSE
+  )
+  cli$sample = rownames(cli)
+  
+  dat = merge(gsva_df, cli, by = "sample")
+  write.csv(dat, file.path(output_dir, paste0(cohort, "_CAF_score_clinical.csv")), row.names = FALSE)
+  
+  ## 2.3 肿瘤与正常组织差异比较 (Tumor vs Normal)
+  if ("Group" %in% colnames(dat)) {
+    plot_dat = dat %>%
+      filter(Group %in% c("Normal", "Tumor"), is.finite(activated_CAFs))
+    
+    if (nrow(plot_dat) > 5) {
+      p.Exp = ggplot(plot_dat, aes(x = Group, y = activated_CAFs, fill = Group)) +
+        geom_violin(trim = FALSE, alpha = 0.7) +
+        geom_boxplot(width = 0.2, fill = "white") +
+        stat_compare_means(method = "t.test", label = "p.signif") +
+        scale_fill_manual(values = c(Normal = "#4DBBD5", Tumor = "#e32427")) +
+        labs(title = cohort, y = "ST3GAL4_CAF score", x = NULL) +
+        theme_classic()
+      
+      ggsave(
+        filename = file.path(output_dir, paste0(cohort, "_CAF_expression.pdf")),
+        plot     = p.Exp,
+        device   = cairo_pdf,
+        width    = 85,
+        height   = 85,
+        units    = "mm"
+      )
+    }
+  }
+  
+  ## 2.4 生存分析与时间依赖性ROC (OS & timeROC)
+  if (all(c("OS.time", "OS") %in% colnames(dat))) {
+    exprSet = dat %>%
+      filter(is.finite(OS.time), is.finite(OS), is.finite(activated_CAFs))
+    
+    if (nrow(exprSet) >= 20) {
+      # (1) 最优截断值划分 (surv_cutpoint)
+      res.cut = surv_cutpoint(exprSet, time = "OS.time", event = "OS", variables = "activated_CAFs")
+      res.cat = surv_categorize(res.cut)
+      write.csv(res.cat, file.path(output_dir, paste0(cohort, "_CAF_cutoff_group.csv")), row.names = FALSE)
+      
+      # (2) Kaplan-Meier 生存曲线
+      fit    = survfit(Surv(OS.time, OS) ~ activated_CAFs, data = res.cat)
+      p.Surv = ggsurvplot(
+        fit,
+        data     = res.cat,
+        conf.int = TRUE,
+        pval     = TRUE,
+        palette  = c("#E41A1C", "#377EB8")
+      )
+      
+      ggsave(
+        filename = file.path(output_dir, paste0(cohort, "_KM.pdf")),
+        plot     = p.Surv$plot,
+        device   = cairo_pdf,
+        width    = 85,
+        height   = 75,
+        units    = "mm"
+      )
+      
+      # (3) 1/3/5年时间依赖性ROC计算
+      roc_dat = exprSet %>%
+        transmute(
+          OS.time        = as.numeric(OS.time),
+          OS             = as.numeric(as.character(OS)),
+          activated_CAFs = as.numeric(activated_CAFs)
+        ) %>%
+        filter(is.finite(OS.time), OS.time > 0, OS %in% c(0, 1), is.finite(activated_CAFs))
+      
+      roc_times_all = c("1-year" = 365, "3-year" = 3 * 365, "5-year" = 5 * 365)
+      roc_times     = roc_times_all[roc_times_all < max(roc_dat$OS.time)]
+      
+      if (length(roc_times) == 0) {
+        return(NULL)
+      }
+      
+      roc_caf = timeROC(
+        T         = roc_dat$OS.time,
+        delta     = roc_dat$OS,
+        marker    = roc_dat$activated_CAFs,
+        cause     = 1,
+        weighting = "marginal",
+        times     = roc_times,
+        iid       = TRUE
+      )
+      
+      auc_df = data.frame(
+        Cohort = cohort,
+        Time   = names(roc_times),
+        Days   = roc_caf$times,
+        AUC    = round(roc_caf$AUC, 3)
+      )
+      write.csv(auc_df, file.path(output_dir, paste0(cohort, "_timeROC_AUC.csv")), row.names = FALSE)
+      
+      # (4) 导出ROC坐标与绘制多时间点ROC曲线
+      roc_xy_all = lapply(seq_along(roc_caf$times), function(i) {
+        data.frame(
+          FPR  = roc_caf$FP[, i],
+          TPR  = roc_caf$TP[, i],
+          Time = names(roc_times)[i],
+          AUC  = round(roc_caf$AUC[i], 3)
+        )
+      }) %>%
+        bind_rows() %>%
+        filter(is.finite(FPR), is.finite(TPR))
+      
+      write.csv(roc_xy_all, file.path(output_dir, paste0(cohort, "_multi_time_ROC_coordinates.csv")), row.names = FALSE)
+      
+      auc_label = paste0(names(roc_times), " AUC=", round(roc_caf$AUC, 3), collapse = "\n")
+      
+      p.ROC = ggplot(roc_xy_all, aes(x = FPR, y = TPR, color = Time)) +
+        geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#D0D0D0") +
+        geom_step(linewidth = 0.9) +
+        annotate("text", x = 0.60, y = 0.15, label = auc_label, hjust = 0, size = 3.2) +
+        scale_color_manual(values = c("1-year" = "#4DBBD5", "3-year" = "#E64B35", "5-year" = "#3C5488")) +
+        coord_equal() +
+        labs(title = paste0(cohort, " Time-dependent ROC"), x = "1-Specificity", y = "Sensitivity", color = NULL) +
+        theme_classic()
+      
+      ggsave(
+        filename = file.path(output_dir, paste0(cohort, "_1_3_5year_ROC.pdf")),
+        plot     = p.ROC,
+        device   = cairo_pdf,
+        width    = 85,
+        height   = 75,
+        units    = "mm"
+      )
+      
+      return(auc_df)
+    }
+  }
+}
+
+### 3.批量执行多队列分析并汇总AUC结果
+all_auc = lapply(cohort_names, run.CAF.analysis)
+all_auc = bind_rows(all_auc)
+
+write.csv(all_auc, file.path(output_dir, "All_cohort_timeROC_AUC_summary.csv"), row.names = FALSE)

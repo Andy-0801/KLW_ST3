@@ -1,0 +1,856 @@
+### 0.环境设置与加载R包
+setwd("E:/PHD_project/Lys_project/1.project/16.klw/sc_data/")
+
+library(SoupX)
+library(DropletUtils)
+library(Seurat)
+library(DoubletFinder)
+library(harmony)
+library(clustree)
+library(GSVA)
+library(clusterProfiler)
+library(msigdbr)
+library(enrichplot)
+library(ComplexHeatmap)
+library(circlize)
+library(pheatmap)
+library(ggplotify)
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+library(patchwork)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(grid)
+
+### 1.读入数据与多样本合并
+indata_dir = "E:/PHD_project/Lys_project/1.project/16.klw/sc_data/filt_data"
+samples    = list.dirs(indata_dir, full.names = TRUE, recursive = FALSE)
+samples    = samples[file.exists(file.path(samples, "matrix.mtx")) | file.exists(file.path(samples, "matrix.mtx.gz"))]
+
+if (length(samples) == 0) stop("No valid 10X folders found")
+
+obj.list = list()
+for (s in samples) {
+  data = Read10X(data.dir = s)
+  obj  = CreateSeuratObject(
+    counts       = data,
+    project      = basename(s),
+    min.cells    = 3,
+    min.features = 200
+  )
+  obj.list[[basename(s)]] = obj
+}
+
+seu = merge(
+  x            = obj.list[[1]],
+  y            = obj.list[-1],
+  add.cell.ids = basename(samples)
+)
+seu
+
+### 2.质控
+dir.create("./1-QC", showWarnings = FALSE)
+
+sc.QC.Mouse = function(merged_seurat){
+  ### 1.1 Number of genes detected per UMI
+  merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+  merged_seurat$feature_ratio    <- merged_seurat$nFeature_RNA / merged_seurat$nCount_RNA
+  
+  ### 1.2 QC index calculation
+  ## 1.2.1 Mitochondrial ratio
+  mito_genes = grep("^MT-", rownames(merged_seurat), ignore.case = TRUE, value = TRUE)
+  print("mito_genes:")
+  print(mito_genes)
+  merged_seurat <- PercentageFeatureSet(object = merged_seurat, features = mito_genes, col.name = "percent_mito")
+  print(fivenum(merged_seurat@meta.data$percent_mito))
+  
+  ## 1.2.2 Ribosomal ratio
+  ribo_genes = grep("^Rp[sl]", rownames(merged_seurat), ignore.case = TRUE, value = TRUE)
+  print("ribo_genes:")
+  print(ribo_genes)
+  merged_seurat <- PercentageFeatureSet(object = merged_seurat, features = ribo_genes, col.name = "percent_ribo")
+  print(fivenum(merged_seurat@meta.data$percent_ribo))
+  
+  ## 1.2.3 Erythrocyte ratio
+  hb_genes <- grep("^Hb[^(p)]", rownames(merged_seurat), ignore.case = TRUE, value = TRUE)
+  print("hb_genes:")
+  print(hb_genes)
+  merged_seurat <- PercentageFeatureSet(object = merged_seurat, features = hb_genes, col.name = "percent_hb")
+  print(fivenum(merged_seurat@meta.data$percent_hb))
+  
+  return(merged_seurat)
+}
+
+seu = sc.QC.Mouse(seu)
+
+p.VlnPlot1 = VlnPlot(seu, group.by = "orig.ident", features = c("nFeature_RNA", "nCount_RNA"),
+                     pt.size = 0.02, ncol = 2) + NoLegend()
+w1 = length(unique(seu$orig.ident)) / 3 + 5
+ggsave(filename = "1-QC/Vlnplot1.pdf", plot = p.VlnPlot1, width = w1, height = 5)
+
+p.VlnPlot2 = VlnPlot(seu, features = c("nFeature_RNA", "nCount_RNA", "percent_mito", "percent_ribo", "percent_hb"),
+                     ncol = 5) + NoLegend()
+w2 = length(unique(seu$orig.ident)) / 2 + 5
+ggsave(filename = "1-QC/Vlnplot2.pdf", plot = p.VlnPlot2, width = w2, height = 5)
+
+## 过滤
+seu <- subset(
+  seu,
+  subset = nFeature_RNA > 200 &
+           nFeature_RNA < 10000 &
+           nCount_RNA > 500 &
+           nCount_RNA < 50000 &
+           percent_mito < 10 &
+           percent_ribo < 20 &
+           percent_hb < 5
+)
+dim(seu)
+
+### 3.预处理与DoubletFinder双联体去除
+## 3.1 标准化与初步降维聚类 (三步标准化或SCTransform二选一)
+seu = NormalizeData(seu, normalization.method = "LogNormalize", scale.factor = 10000)
+seu = FindVariableFeatures(seu, selection.method = "vst", nfeatures = 2000)
+seu = ScaleData(seu)
+seu = RunPCA(seu, npcs = 30)
+seu = RunUMAP(seu, dims = 1:30)
+seu = FindNeighbors(seu, reduction = "pca", dims = 1:30)
+seu = FindClusters(seu, resolution = 0.7)
+
+## 3.2 最优pK参数扫描
+sweep.res.list = paramSweep(seu, PCs = 1:30, sct = FALSE)
+sweep.stats    = summarizeSweep(sweep.res.list, GT = FALSE)
+bcmvn          = find.pK(sweep.stats)
+bcmvn$pK       = as.numeric(as.character(bcmvn$pK))
+
+p.pK = ggplot(bcmvn, aes(x = pK, y = BCmetric)) +
+  geom_line(color = "#00A9FF", linewidth = 1.2) +
+  geom_point(color = "black", size = 2) +
+  geom_point(data = bcmvn[which.max(bcmvn$BCmetric), ], aes(x = pK, y = BCmetric), color = "red", size = 4) +
+  theme_classic(base_size = 14) +
+  labs(title = "Optimal pK Selection", x = "pK", y = "BCmetric")
+ggsave(filename = "1-QC/Optimal_pK.pdf", plot = p.pK, width = 7, height = 5)
+
+optimal_pK = as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+nExp       = round(0.008 * ncol(seu))
+
+## 3.3 运行DoubletFinder并过滤双联体
+seu = doubletFinder(
+  seu,
+  PCs        = 1:30,
+  pN         = 0.25,
+  pK         = optimal_pK,
+  nExp       = nExp,
+  reuse.pANN = FALSE,
+  sct        = FALSE
+)
+
+df_col = tail(grep("^DF.classifications", colnames(seu@meta.data), value = TRUE), 1)
+p.DF   = DimPlot(seu, group.by = df_col, label = TRUE) + ggtitle("DoubletFinder Predictions")
+ggsave(filename = "1-QC/DoubletFinder_UMAP.pdf", plot = p.DF, width = 7, height = 6)
+
+seurat_clean = seu[, seu@meta.data[[df_col]] == "Singlet"]
+saveRDS(seurat_clean, file = "seurat_clean_klw.rds")
+
+### 4.Harmony批次整合与重分群
+## 4.1 首次Harmony整合
+object.combined = seurat_clean
+DefaultAssay(object.combined) = "RNA"
+Idents(object.combined)       = "seurat_clusters"
+
+object.combined = NormalizeData(object.combined, normalization.method = "LogNormalize", scale.factor = 10000)
+object.combined = FindVariableFeatures(object.combined, selection.method = "vst", nfeatures = 2000)
+object.combined = ScaleData(object.combined, verbose = FALSE)
+object.combined = RunPCA(object.combined, npcs = 50, verbose = FALSE)
+object.combined = RunHarmony(object.combined, group.by.vars = "orig.ident")
+
+object.combined = RunUMAP(object.combined, reduction = "harmony", dims = 1:30)
+object.combined = RunTSNE(object.combined, reduction = "harmony", dims = 1:30)
+object.combined = FindNeighbors(object.combined, reduction = "harmony", dims = 1:30)
+
+p1 = DimPlot(object.combined, reduction = "umap", group.by = "orig.ident", pt.size = 1.0)
+p2 = DimPlot(object.combined, reduction = "umap", label = TRUE, pt.size = 1.0)
+ggsave(filename = "Dimplot_group_Normal_Harmony.pdf", plot = p1 + p2, width = 20, height = 10)
+
+p.Split = DimPlot(object.combined, reduction = "umap", split.by = "orig.ident", ncol = 5, pt.size = 1.0)
+ggsave(filename = "Dimplot_split_Normal_Harmony.pdf", plot = p.Split, width = 50, height = 10, limitsize = FALSE)
+saveRDS(object.combined, file = "integration_Normal_Harmony.rds")
+
+## 4.2 多分辨率聚类树与分组映射
+object.combined$Group = ifelse(object.combined$orig.ident %in% c("WT_1", "WT_2", "WT_3"), "WT", "KO")
+object.combined = FindClusters(object.combined, resolution = seq(0.1, 1.6, 0.2))
+p.Clustree      = clustree(object.combined@meta.data, prefix = "RNA_snn_res.")
+ggsave(filename = "clustree_resolution.pdf", plot = p.Clustree, width = 10, height = 8)
+
+object.combined = FindClusters(object.combined, resolution = 0.7)
+saveRDS(object.combined, file = "klw_st07_sce_merged.rds")
+
+## 4.3 剔除Cluster 4后二次Harmony整合
+object.combined = subset(object.combined, idents = setdiff(levels(object.combined), c("4")))
+object.combined = NormalizeData(object.combined, normalization.method = "LogNormalize", scale.factor = 10000)
+object.combined = FindVariableFeatures(object.combined, selection.method = "vst", nfeatures = 2000)
+object.combined = ScaleData(object.combined, verbose = FALSE)
+object.combined = RunPCA(object.combined, npcs = 50, verbose = FALSE)
+object.combined = RunHarmony(object.combined, group.by.vars = "orig.ident")
+object.combined = RunUMAP(object.combined, reduction = "harmony", dims = 1:30)
+object.combined = FindNeighbors(object.combined, reduction = "harmony", dims = 1:30)
+object.combined = FindClusters(object.combined, resolution = 0.5)
+
+### 5.细胞类型注释与特征基因热图
+## 5.1 谱系Marker气泡图检视
+genes_to_check = list(
+  T_cells           = c("Cd3e", "Cd3d", "Cd3g"),
+  CD4_T             = c("Cd3e", "Cd4", "Il7r"),
+  CD8_T             = c("Cd3e", "Cd8a", "Cd8b1"),
+  Treg              = c("Foxp3", "Il2ra", "Ctla4"),
+  B_cells           = c("Cd19", "Ms4a1", "Cd79a", "Cd79b", "Pax5"),
+  Plasma_cells      = c("Sdc1", "Mzb1", "Jchain", "Prdm1", "Xbp1"),
+  NK_cells          = c("Nkg7", "Klrk1", "Ncr1", "Klrb1c"),
+  Monocytes         = c("Ly6c2", "Ccr2", "Sell", "Itgam", "Csf1r"),
+  Macrophages       = c("Adgre1", "Cd68", "Fcgr1", "C1qa", "C1qb", "C1qc"),
+  Kupffer           = c("Timd4", "Clec4f", "Marco", "Vsig4"),
+  TAM               = c("Spp1", "Trem2", "Gpnmb", "Apoe", "Lgals3", "Mrc1"),
+  M_MDSC            = c("Ly6c2", "Ccr2", "Arg1", "Nos2", "Il10", "S100a8", "S100a9", "Cybb", "Ncf1", "Ncf2", "Mmp8", "Mmp9"),
+  PMN_MDSC          = c("Ly6g", "S100a8", "S100a9", "Cxcr2", "Mmp8", "Arg1"),
+  Neutrophils       = c("Ly6g", "S100a8", "S100a9", "Elane", "Mmp9", "Mpo", "Camp", "Ltf", "Csf3r"),
+  Dendritic         = c("Itgax", "Zbtb46", "Flt3"),
+  cDC1              = c("Xcr1", "Clec9a"),
+  cDC2              = c("Sirpa", "Cd172a", "Irf4"),
+  pDC               = c("Siglech", "Bst2", "Tcf4"),
+  Basophils         = c("Mcpt8", "Fcer1a", "Gata2"),
+  Mast_cells        = c("Kit", "Fcer1a", "Cpa3", "Mcpt1", "Mcpt4", "Cd63", "S100a6"),
+  HSC_progenitor    = c("Kit", "Ly6a", "Meis1", "Gata2", "Hoxb4"),
+  Hepatocytes       = c("Alb", "Ttr", "Apoa1", "Ass1", "Cyp2e1", "Glul", "Cps1"),
+  Mature_hepatocyte = c("Alb", "Ttr", "Cyp2e1", "Slco1b2", "Glul", "Ghr"),
+  Tumor_cells       = c("Afp", "Gpc3", "Spp1", "Hmga2", "Epcam", "Krt8", "Krt18"),
+  Proliferating     = c("Mki67", "Top2a", "Cdk1", "Birc5", "Cenpf"),
+  Cholangiocytes    = c("Krt19", "Krt7", "Epcam", "Sox9", "Pkhd1"),
+  Biliary_like      = c("Abcb4", "Abcc2", "Slc4a4", "Krt19", "Sox9"),
+  Endothelial       = c("Pecam1", "Cdh5", "Kdr", "Emcn"),
+  LSEC              = c("Stab2", "Lyve1", "Clec4g", "Fcgr2b"),
+  Fibroblasts       = c("Col1a1", "Col1a2", "Dcn", "Pdgfra", "Lum"),
+  CAFs              = c("Col3a1", "Sparc", "Fbn1", "Fstl1", "Dcn"),
+  Stellate_cells    = c("Reln", "Rgs5", "Des", "Lrat", "Pdgfrb"),
+  Pericytes         = c("Rgs5", "Mcam", "Cspg4", "Pdgfrb"),
+  Target_features   = c("Pdgfra", "Cd45", "Ms4a7")
+)
+
+feature.order = unique(unlist(genes_to_check, use.names = FALSE))
+feature.order = feature.order[feature.order %in% rownames(object.combined)]
+
+p.DotCluster = DotPlot(object.combined, features = feature.order, group.by = "seurat_clusters") +
+  RotatedAxis() +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1, size = 9),
+    axis.text.y = element_text(size = 10),
+    plot.title  = element_text(hjust = 0.5)
+  ) +
+  labs(x = "Markers", y = "Clusters", title = "Mouse Liver Tumor scRNA-seq Annotation")
+ggsave(filename = "Cluster_Annotation_DotPlot.pdf", plot = p.DotCluster, width = 18, height = 8)
+
+## 5.2 簇差异Markers计算与细胞类型映射
+markers_all   = FindAllMarkers(object.combined, only.pos = TRUE, test.use = "wilcox", logfc.threshold = 0.25, min.pct = 0.1)
+top10_markers = markers_all %>% group_by(cluster) %>% slice_max(order_by = avg_log2FC, n = 10)
+write.csv(top10_markers, "top10_markers_RNA.csv", row.names = FALSE)
+
+Idents(object.combined) = "seurat_clusters"
+celltype_map = c(
+  "0"  = "CAF",          "1"  = "CAF",          "2"  = "Hepatocyte",
+  "3"  = "TAM",          "4"  = "Hepatocyte",   "5"  = "T/NK",
+  "6"  = "Hepatocyte",   "7"  = "Fibroblast",   "8"  = "Endothelial",
+  "9"  = "Activated_CAF","10" = "Hepatocyte",   "11" = "Kupffer_cell",
+  "12" = "Fibroblast",   "13" = "T/NK",         "14" = "Monocyte",
+  "15" = "Hepatocyte",   "16" = "Endothelial",  "17" = "Hepatocyte",
+  "18" = "B_cell",       "19" = "ECM_CAF",      "20" = "Hepatocyte",
+  "21" = "DC",           "22" = "Macrophage",   "23" = "Hepatocyte",
+  "24" = "Neutrophil"
+)
+
+object.combined$celltype = plyr::mapvalues(
+  object.combined$seurat_clusters,
+  from = names(celltype_map),
+  to   = celltype_map
+)
+Idents(object.combined) = "celltype"
+
+palette_manual = c(
+  "CAF"           = "#E41A1C", "Activated_CAF" = "#FB6A4A", "ECM_CAF"      = "#FC9272",
+  "Fibroblast"    = "#FCAE91", "Hepatocyte"    = "#FFD92F", "TAM"          = "#984EA3",
+  "Kupffer_cell"  = "#8C564B", "Macrophage"    = "#6A3D9A", "Monocyte"     = "#D62728",
+  "Neutrophil"    = "#E377C2", "T/NK"          = "#377EB8", "B_cell"       = "#FF7F00",
+  "Endothelial"   = "#4DAF4A", "DC"            = "#17BECF"
+)
+
+p.UMAP.ident = DimPlot(object.combined, reduction = "umap", group.by = "orig.ident", label = TRUE, repel = TRUE)
+p.UMAP.type  = DimPlot(object.combined, reduction = "umap", group.by = "celltype", label = TRUE, repel = TRUE, cols = palette_manual)
+p.UMAP.split = DimPlot(object.combined, reduction = "umap", split.by = "Group", group.by = "celltype", label = TRUE, repel = TRUE, cols = palette_manual)
+ggsave(filename = "Annotated_UMAP_Combined.pdf", plot = p.UMAP.ident + p.UMAP.type + p.UMAP.split, width = 24, height = 7)
+saveRDS(object.combined, file = "object.combined.rds")
+
+## 5.3 细胞类型特征基因缩放热图
+heatmap_genes = unique(c(
+  "Ly6g", "Camp", "Ltf", "Csf3r", "Cxcr2",
+  "Adgre1", "Cd68", "Lyz2", "Ctss", "Timd4",
+  "Ccr7", "Il12b", "Fscn1", "H2-Eb1", "Cst3",
+  "Thsd4", "Pdgfd", "Clu", "Krt19", "Epcam",
+  "Cd19", "Ms4a1", "Cd79a", "Cd79b", "Pax5",
+  "Ly6c2", "Chil3", "Plac8", "Ifitm3", "Ifitm6",
+  "Vsig4", "Clec4f", "Marco", "Cd5l",
+  "Mmp2", "Mmp11", "Sparc", "Inhba", "Lrrc15",
+  "Pecam1", "Cdh5", "Kdr", "Emcn", "Flt1",
+  "Acta2", "Tagln", "Myl9", "Col1a1", "Col1a2",
+  "Cd3e", "Cd3d", "Cd3g", "Cd8a", "Cd8b1",
+  "Apoe", "Spp1", "Ms4a7", "Gpnmb", "Trem2",
+  "Alb", "Ttr", "Apoa1", "Ass1", "Cyp2e1",
+  "Dcn", "Lum", "Fbn1", "Des", "Cnn1"
+))
+heatmap_genes = heatmap_genes[heatmap_genes %in% rownames(object.combined)]
+
+p.DotTemp    = DotPlot(object = object.combined, features = heatmap_genes, group.by = "celltype")
+heatmap_data = p.DotTemp$data %>%
+  dplyr::select(features.plot, id, avg.exp.scaled) %>%
+  tidyr::pivot_wider(names_from = features.plot, values_from = avg.exp.scaled) %>%
+  tibble::column_to_rownames(var = "id")
+
+p.Pheatmap = pheatmap(
+  heatmap_data,
+  cellwidth       = 10,
+  cellheight      = 15,
+  cluster_rows    = FALSE,
+  cluster_cols    = FALSE,
+  color           = colorRampPalette(c("#377EB8", "#eaf2f9", "#E41A1C"))(100),
+  display_numbers = FALSE,
+  fontsize        = 8,
+  fontsize_row    = 8,
+  fontsize_col    = 8,
+  main            = "Immucelltype Gene Expression Heatmap"
+)
+p.HeatmapGG = as.ggplot(p.Pheatmap)
+ggsave(filename = "Immucelltype_Gene_Expression_Heatmap.pdf", plot = p.HeatmapGG, width = 32, height = 10.5, units = "cm")
+
+### 6.细胞比例统计与肝细胞靶基因St3gal4表达比较
+## 6.1 总体细胞组成堆叠柱状图
+umap_df = object.combined@meta.data %>% dplyr::select(orig.ident, Group, celltype)
+
+celltype_prop = umap_df %>%
+  group_by(Group, celltype) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Group) %>%
+  mutate(proportion = n / sum(n) * 100)
+
+p.Proportion = ggplot(celltype_prop, aes(x = Group, y = proportion, fill = celltype)) +
+  geom_bar(stat = "identity", position = "stack", color = "white", linewidth = 0.1) +
+  scale_fill_manual(values = palette_manual) +
+  theme_classic() +
+  labs(x = NULL, y = "Percentage (%)", title = "Cell composition")
+ggsave(filename = "Celltype_proportion_stack.pdf", plot = p.Proportion, width = 6, height = 6)
+
+## 6.2 样本水平细胞比例统计检验
+celltype_sample_prop = umap_df %>%
+  count(orig.ident, Group, celltype, name = "n_cells") %>%
+  complete(nesting(orig.ident, Group), celltype, fill = list(n_cells = 0)) %>%
+  group_by(orig.ident) %>%
+  mutate(proportion = n_cells / sum(n_cells) * 100) %>%
+  ungroup()
+
+celltype_group_prop = celltype_sample_prop %>%
+  group_by(Group, celltype) %>%
+  summarise(mean_prop = mean(proportion), sd_prop = sd(proportion), n_sample = n(), .groups = "drop")
+
+stat_results_pos = celltype_sample_prop %>%
+  group_by(celltype) %>%
+  summarise(p.value = t.test(proportion ~ Group)$p.value, .groups = "drop") %>%
+  mutate(
+    p.adjust     = p.adjust(p.value, method = "BH"),
+    significance = case_when(
+      p.adjust < 0.001 ~ "***",
+      p.adjust < 0.01  ~ "**",
+      p.adjust < 0.05  ~ "*",
+      TRUE             ~ "ns"
+    )
+  ) %>%
+  left_join(
+    celltype_group_prop %>%
+      group_by(celltype) %>%
+      summarise(y.position = max(mean_prop + sd_prop, na.rm = TRUE) * 1.15, .groups = "drop"),
+    by = "celltype"
+  )
+
+p.GroupCompare = ggplot(celltype_group_prop, aes(celltype, mean_prop, fill = Group)) +
+  geom_col(position = position_dodge(0.8), width = 0.7) +
+  geom_errorbar(aes(ymin = pmax(mean_prop - sd_prop, 0), ymax = mean_prop + sd_prop),
+                position = position_dodge(0.8), width = 0.25) +
+  geom_text(data = stat_results_pos, aes(celltype, y.position, label = significance),
+            inherit.aes = FALSE, size = 5, fontface = "bold") +
+  scale_fill_manual(values = c(KO = "#E41A1C", WT = "#377EB8")) +
+  coord_cartesian(clip = "off") +
+  labs(x = NULL, y = "Cell proportion (%)", title = "Cell type composition comparison") +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y     = element_text(size = 11),
+    legend.position = "top",
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    plot.margin     = margin(5, 5, 30, 5)
+  )
+ggsave(filename = "Celltype_proportion_KO_WT.pdf", plot = p.GroupCompare, width = 10, height = 6)
+
+write.csv(stat_results_pos, "Celltype_proportion_statistics.csv", row.names = FALSE)
+write.csv(celltype_sample_prop, "Celltype_proportion_sample_level.csv", row.names = FALSE)
+
+## 6.3 细胞比例分面箱线图与肝细胞St3gal4表达比较
+celltype_sample_prop$Group = factor(celltype_sample_prop$Group, levels = c("WT", "KO"))
+p.PropBox = ggplot(celltype_sample_prop, aes(Group, proportion, color = Group)) +
+  geom_boxplot(width = 0.6, alpha = 0.25, outlier.shape = NA) +
+  geom_jitter(width = 0.15, size = 2, alpha = 0.8) +
+  stat_compare_means(comparisons = list(c("WT", "KO")), method = "t.test", label = "p.signif", hide.ns = FALSE, tip.length = 0.01) +
+  facet_wrap(~celltype, scales = "free_y") +
+  scale_color_manual(values = c(WT = "#377EB8", KO = "#E41A1C")) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.2))) +
+  labs(x = NULL, y = "Cell proportion") +
+  theme_classic() +
+  theme(strip.text = element_text(face = "bold"), axis.text.x = element_text(face = "bold"), legend.position = "none")
+ggsave(filename = "Celltype_proportion_facet_boxplot.pdf", plot = p.PropBox, width = 12, height = 9)
+
+Hepatocyte = subset(object.combined, subset = celltype == "Hepatocyte")
+DefaultAssay(Hepatocyte) = "RNA"
+plot_df = FetchData(Hepatocyte, vars = c("St3gal4", "Group")) %>%
+  rename(expression = St3gal4) %>%
+  filter(!is.na(Group))
+
+p.St3gal4 = ggplot(plot_df, aes(Group, expression, fill = Group)) +
+  geom_boxplot(width = 0.6, outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(aes(color = Group), width = 0.15, size = 0.4, alpha = 0.25) +
+  stat_compare_means(comparisons = list(c("WT", "KO")), method = "wilcox.test", label = "p.format") +
+  scale_fill_manual(values = c(WT = "#377EB8", KO = "#E41A1C")) +
+  scale_color_manual(values = c(WT = "#377EB8", KO = "#E41A1C")) +
+  labs(x = NULL, y = "ST3GAL4 expression", title = "ST3GAL4 expression by group") +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold"))
+ggsave(filename = "Hepatocyte_St3gal4_expression.pdf", plot = p.St3gal4, width = 5, height = 5)
+
+### 7.TAM亚群功能GSVA评分、极化特征与GSEA富集分析
+## 7.1 提取TAM子集与构建功能基因集
+TAM = subset(object.combined, subset = celltype == "TAM")
+DefaultAssay(TAM) = "RNA"
+
+gene = read.table(
+  "E:/PHD_project/Lys_project/1.project/4.hcc/实验验证/转录组/分析/Tam_sub/SCORE/sub_tams.txt",
+  stringsAsFactors = FALSE, sep = "\t", header = TRUE
+)
+gene$gene_symbol = paste0(
+  toupper(substr(tolower(gene$gene_symbol), 1, 1)),
+  substr(tolower(gene$gene_symbol), 2, nchar(gene$gene_symbol))
+)
+
+custom_genesets = list(
+  Lysosome_dysfunction = c("Sqstm1", "Map1lc3b", "Atg5", "Atg7", "Gaa", "Npc1", "Lipa", "Hspa5", "Atf4", "Ddit3", "Ctsb", "Ctsd"),
+  M2_TAM               = c("Arg1", "Mrc1", "Cd163", "Il10", "Tgfb1", "Lgals3", "C1qa", "C1qb", "C1qc", "Ms4a7", "Mertk"),
+  M1_TAM               = c("Nos2", "Il1b", "Tnf", "Cd86", "Cxcl9", "Cxcl10", "Cxcl11", "Il6", "Ccl3", "Ccl4", "Ccl5", "Nfkb1", "Rel")
+)
+
+new_gene = enframe(custom_genesets, name = "gs_name", value = "gene_symbol") %>%
+  tidyr::unnest_longer(gene_symbol) %>%
+  group_by(gs_name) %>%
+  mutate(sample = paste0(gs_name, "_", row_number())) %>%
+  ungroup() %>%
+  select(sample, gs_name, gene_symbol)
+
+expr_mat = as.matrix(GetAssayData(TAM, assay = "RNA", slot = "data"))
+gene = bind_rows(gene, new_gene) %>%
+  filter(!is.na(gs_name), !is.na(gene_symbol), gene_symbol != "", gene_symbol %in% rownames(expr_mat)) %>%
+  distinct(gs_name, gene_symbol)
+
+geneset = split(gene$gene_symbol, gene$gs_name)
+geneset = lapply(geneset, unique)
+geneset = geneset[lengths(geneset) >= 3]
+
+## 7.2 计算TAM GSVA评分与样本级汇总热图/箱线图
+gsva_mat = GSVA::gsva(
+  expr          = expr_mat,
+  gset.idx.list = geneset,
+  method        = "gsva",
+  kcdf          = "Gaussian",
+  min.sz        = 3,
+  max.sz        = 500,
+  verbose       = TRUE,
+  parallel.sz   = max(1, parallel::detectCores() - 1)
+)
+
+gsva_df     = as.data.frame(t(gsva_mat)) %>% rownames_to_column("cell")
+metadata_df = TAM@meta.data %>% rownames_to_column("cell") %>% select(cell, orig.ident)
+
+gsva_group_mean = gsva_df %>%
+  left_join(metadata_df, by = "cell") %>%
+  filter(!is.na(orig.ident)) %>%
+  group_by(orig.ident) %>%
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+group_mat = gsva_group_mean %>% column_to_rownames("orig.ident") %>% as.matrix() %>% t()
+
+pdf("TAM_GSVA_group_heatmap.pdf", width = 7, height = 8)
+pheatmap(
+  group_mat,
+  scale           = "row",
+  color           = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+  cluster_rows    = TRUE,
+  cluster_cols    = TRUE,
+  border_color    = "grey80",
+  fontsize_row    = 9,
+  fontsize_col    = 10,
+  display_numbers = FALSE,
+  main            = "Mean GSVA scores of TAMs by group"
+)
+dev.off()
+
+group_df = as.data.frame(t(group_mat)) %>%
+  rownames_to_column("Sample") %>%
+  mutate(
+    Group = case_when(
+      grepl("^KO_", Sample) ~ "KO",
+      grepl("^WT_", Sample) ~ "WT",
+      TRUE                  ~ NA_character_
+    ),
+    Group = factor(Group, levels = c("WT", "KO"))
+  )
+
+group_long = group_df %>%
+  pivot_longer(cols = -c(Sample, Group), names_to = "Signature", values_to = "GSVA_score") %>%
+  filter(!is.na(Group), !is.na(GSVA_score))
+group_long$Signature = factor(group_long$Signature, levels = rownames(group_mat))
+
+p.GSVA.Box = ggplot(group_long, aes(x = Group, y = GSVA_score, color = Group)) +
+  geom_boxplot(width = 0.6, alpha = 0.25, outlier.shape = NA) +
+  geom_jitter(width = 0.12, size = 2.2, alpha = 0.9) +
+  stat_compare_means(comparisons = list(c("WT", "KO")), method = "t.test", label = "p.signif", hide.ns = FALSE, tip.length = 0.01) +
+  facet_wrap(~ Signature, scales = "free_y", ncol = 4) +
+  scale_color_manual(values = c(WT = "#377EB8", KO = "#E41A1C")) +
+  scale_y_continuous(expand = expansion(mult = c(0.08, 0.25))) +
+  labs(x = NULL, y = "Mean GSVA score", title = "GSVA scores between WT and KO") +
+  theme_classic(base_size = 12) +
+  theme(
+    strip.text      = element_text(face = "bold", size = 9),
+    axis.text.x     = element_text(face = "bold"),
+    legend.position = "none",
+    plot.title      = element_text(face = "bold", hjust = 0.5)
+  )
+ggsave(filename = "GSVA_KO_vs_WT_boxplot.pdf", plot = p.GSVA.Box, width = 12, height = 10)
+
+## 7.3 TAM极化与抗原呈递标志物气泡图
+Suppressive_TAM  = c("Arg1", "Mrc1", "C1qa", "C1qb", "C1qc", "Spp1")
+Inflammatory_TAM = c("Stat1", "Nfkb1", "Il1b", "Cd86", "Nos2", "Cd80", "Cd40")
+APC_TAM          = c("H2-Ab1", "H2-Eb1", "Ciita", "Tap1", "Tap2")
+
+gene_order = unique(c(Suppressive_TAM, Inflammatory_TAM, APC_TAM))
+gene_group = setNames(rep("Other", length(gene_order)), gene_order)
+gene_group[Suppressive_TAM]  = "Suppressive"
+gene_group[Inflammatory_TAM] = "Inflammatory"
+gene_group[APC_TAM]          = "APC"
+gene_group["Cd86"]           = "Inflammatory/APC"
+gene_labels = setNames(paste0(gene_order, "\n(", gene_group[gene_order], ")"), gene_order)
+
+p.TAM.Dot = DotPlot(TAM, features = gene_order, group.by = "Group", cols = c("grey90", "#B2182B"), dot.scale = 7) +
+  scale_x_discrete(labels = gene_labels) +
+  geom_vline(xintercept = c(length(Suppressive_TAM) + 0.5, length(unique(c(Suppressive_TAM, Inflammatory_TAM))) + 0.5),
+             linetype = "dashed", color = "grey50") +
+  labs(title = "TAM functional gene signatures", x = NULL, y = NULL, color = "Average expression", size = "Percent expressed") +
+  RotatedAxis() +
+  theme_classic(base_size = 12) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5), axis.text.x = element_text(size = 8), legend.position = "right")
+ggsave(filename = "TAM_functional_signatures_DotPlot.pdf", plot = p.TAM.Dot, width = 10, height = 5)
+saveRDS(TAM, file = "klw_TAM_0712.rds")
+
+## 7.4 TAM差异表达与Hallmark / 焦点通路GSEA
+TAM$Group   = factor(TAM$Group, levels = c("WT", "KO"))
+Idents(TAM) = "Group"
+
+TAM_DEG_all = FindMarkers(TAM, ident.1 = "KO", ident.2 = "WT", group.by = "Group", logfc.threshold = 0, min.pct = 0, only.pos = FALSE) %>%
+  rownames_to_column("gene")
+
+fc_col = intersect(c("avg_log2FC", "avg_logFC"), colnames(TAM_DEG_all))[1]
+TAM_DEG_all = TAM_DEG_all %>%
+  mutate(rank_score = sign(.data[[fc_col]]) * -log10(pmax(p_val, 1e-300))) %>%
+  filter(is.finite(rank_score), !is.na(gene)) %>%
+  arrange(desc(rank_score)) %>%
+  distinct(gene, .keep_all = TRUE)
+
+geneList = setNames(TAM_DEG_all$rank_score, TAM_DEG_all$gene)
+geneList = sort(geneList, decreasing = TRUE)
+
+hallmark_set  = msigdbr(species = "Mus musculus", category = "H") %>% select(gs_name, gene_symbol)
+gsea_hallmark = GSEA(geneList, TERM2GENE = hallmark_set, exponent = 1, minGSSize = 10, maxGSSize = 500, eps = 0, pvalueCutoff = 1, pAdjustMethod = "BH", seed = TRUE, verbose = FALSE)
+
+p.GSEA.Dot   = dotplot(gsea_hallmark, showCategory = 20, split = ".sign") + facet_grid(. ~ .sign) + ggtitle("Hallmark GSEA: KO versus WT")
+p.GSEA.Ridge = ridgeplot(gsea_hallmark, showCategory = 20) + ggtitle("Hallmark GSEA: KO versus WT")
+ggsave(filename = "TAM_Hallmark_GSEA_dotplot.pdf", plot = p.GSEA.Dot, width = 10, height = 8)
+ggsave(filename = "TAM_Hallmark_GSEA_ridgeplot.pdf", plot = p.GSEA.Ridge, width = 10, height = 8)
+
+pathway_key = tibble(
+  category = c("TNF/NFκB", "IL-1 response", "Lysosome", "Autophagy", "Oxidative stress", "Extracellular trap formation"),
+  pattern  = c(
+    "TNFA_SIGNALING_VIA_NFKB|TNF.*NFKB|NFKB.*TNF|TUMOR_NECROSIS_FACTOR|NF_KAPPA_B",
+    "INTERLEUKIN_1|IL_1|IL1|RESPONSE_TO_INTERLEUKIN_1",
+    "LYSOSOM|LYTIC_VACUOLE",
+    "AUTOPHAG|AUTOPHAGOSOM|MITOPHAG",
+    "OXIDATIVE_STRESS|REACTIVE_OXYGEN|ROS|HYDROGEN_PEROXIDE",
+    "EXTRACELLULAR_TRAP|NEUTROPHIL_EXTRACELLULAR_TRAP|NET_FORMATION|NETOSIS|CHROMATIN_DECONDENSATION|HISTONE_CITRULLINATION|PEPTIDYLARGININE_DEIMIN"
+  )
+)
+
+msig_all = msigdbr(species = "Mus musculus") %>%
+  mutate(source = coalesce(gs_subcat, gs_cat)) %>%
+  select(source, gs_name, gene_symbol)
+
+selected_pathways = bind_rows(
+  lapply(seq_len(nrow(pathway_key)), function(index) {
+    msig_all %>%
+      filter(str_detect(str_to_upper(gs_name), pathway_key$pattern[index])) %>%
+      mutate(category = pathway_key$category[index])
+  })
+) %>%
+  mutate(term = paste(source, gs_name, sep = ": ")) %>%
+  distinct(category, source, gs_name, term, gene_symbol)
+
+pathway_meta    = selected_pathways %>% distinct(term, category, source, gs_name)
+term2gene_focus = selected_pathways %>% select(term, gene_symbol) %>% distinct()
+
+set.seed(123)
+gsea_focus = GSEA(
+  geneList      = geneList,
+  TERM2GENE     = term2gene_focus,
+  minGSSize     = 5,
+  maxGSSize     = 500,
+  exponent      = 1,
+  eps           = 0,
+  pvalueCutoff  = 1,
+  pAdjustMethod = "BH",
+  seed          = TRUE,
+  verbose       = FALSE
+)
+
+output_dir = "GSEA_significant_pathways"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+plot_table = gsea_focus@result %>%
+  left_join(pathway_meta, by = c("ID" = "term")) %>%
+  filter(!is.na(p.adjust), p.adjust < 0.05)
+
+safe_name = function(x) str_replace_all(x, "[^A-Za-z0-9_-]+", "_")
+
+for (i in seq_len(nrow(plot_table))) {
+  stat     = plot_table[i, ]
+  id       = stat$ID
+  name     = str_remove(id, "^[^:]+:\\s*")
+  category = if ("category" %in% names(stat) && !is.na(stat$category)) stat$category else "Significant"
+  sub_dir  = file.path(output_dir, safe_name(category))
+  dir.create(sub_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  p.GSEA.Curve = gseaplot2(
+    gsea_focus,
+    geneSetID    = id,
+    color        = ifelse(stat$NES >= 0, "#FA5860", "#3C78D8"),
+    title        = sprintf("%s: %s\nNES = %.2f, P = %.4f, FDR = %.4f", category, name, stat$NES, stat$pvalue, stat$p.adjust),
+    pvalue_table = TRUE,
+    base_size    = 11
+  )
+  pdf(file.path(sub_dir, paste0("GSEA_", safe_name(name), ".pdf")), width = 8, height = 6)
+  tryCatch(print(p.GSEA.Curve), finally = dev.off())
+}
+
+### 8.T/NK亚群重分群与CD8+ T细胞功能模块评分
+## 8.1 提取T/NK亚群与重聚类注释
+tnk = subset(object.combined, subset = celltype == "T/NK")
+DefaultAssay(tnk) = "RNA"
+
+tnk = subset(tnk, idents = intersect(levels(tnk), c("0", "3", "4", "5", "6", "T/NK")))
+tnk = NormalizeData(tnk, verbose = FALSE)
+tnk = FindVariableFeatures(tnk, nfeatures = 2000, verbose = FALSE)
+tnk = ScaleData(tnk, verbose = FALSE)
+tnk = RunPCA(tnk, npcs = 30, verbose = FALSE)
+tnk = FindNeighbors(tnk, dims = 1:20, verbose = FALSE)
+tnk = FindClusters(tnk, resolution = 0.4, verbose = FALSE)
+tnk = RunUMAP(tnk, dims = 1:20, verbose = FALSE)
+
+tnk_map = c("0" = "CD8_T", "1" = "CD4_T", "2" = "CD8_T", "3" = "CD8_T", "4" = "NK", "5" = "CD4_T", "6" = "CD4_T")
+tnk$celltype = plyr::mapvalues(as.character(tnk$seurat_clusters), from = names(tnk_map), to = tnk_map)
+
+## 8.2 提取CD8+ T细胞与计算13项功能签名AddModuleScore
+CD8_T = subset(tnk, subset = celltype == "CD8_T")
+DefaultAssay(CD8_T) = "RNA"
+CD8_T$Group = factor(
+  case_when(
+    CD8_T$orig.ident %in% c("KO_1", "KO_2", "KO_3") ~ "KO",
+    CD8_T$orig.ident %in% c("WT_1", "WT_2", "WT_3") ~ "WT",
+    TRUE ~ as.character(CD8_T$Group)
+  ),
+  levels = c("WT", "KO")
+)
+
+gene_signatures = list(
+  Naive_Memory  = c("Il7r", "Ccr7", "Sell", "Tcf7", "Lef1", "Klf2", "Foxo1", "Slamf6"),
+  CD8_Effector  = c("Ifng", "Gzmb", "Prf1", "Nkg7", "Ccl5", "Fasl", "Cx3cr1"),
+  Cytotoxicity  = c("Gzmb", "Gzma", "Prf1", "Nkg7", "Ccl5", "Ctsw"),
+  TCR_Signaling = c("Cd3d", "Cd3e", "Cd247", "Lck", "Zap70", "Lat", "Itk", "Trac"),
+  Activation    = c("Cd69", "Tbx21", "Eomes", "Ifng", "Cx3cr1", "Klrg1", "Ccl5"),
+  Exhaustion    = c("Pdcd1", "Havcr2", "Lag3", "Tigit", "Ctla4", "Entpd1", "Tox"),
+  Stem_like     = c("Tcf7", "Slamf6", "Cxcr5", "Lef1", "Il7r"),
+  IFN_Response  = c("Stat1", "Irf1", "Isg15", "Ifit1", "Ifit3", "Mx1"),
+  Migration     = c("Cx3cr1", "Cxcr3", "Ccr5", "Itgal", "Sell"),
+  Glycolysis    = c("Slc2a1", "Hk2", "Pkm", "Ldha", "Gapdh", "Aldoa", "Pfkfb3"),
+  OxPhos        = c("Cox5a", "Cox6a1", "Atp5f1a", "Ndufa1", "Ndufb8", "Uqcrc1"),
+  FAO           = c("Cpt1a", "Acadm", "Acadl", "Acadvl", "Hadh", "Echs1"),
+  Apoptosis     = c("Bax", "Bak1", "Bid", "Casp3", "Casp8", "Fasl")
+)
+gene_signatures       = lapply(gene_signatures, unique)
+gene_signatures_found = lapply(gene_signatures, function(g) intersect(g, rownames(CD8_T)))
+missing_genes         = lapply(gene_signatures, function(g) setdiff(g, rownames(CD8_T)))
+
+signature_qc = data.frame(
+  Signature     = names(gene_signatures),
+  Total_genes   = lengths(gene_signatures),
+  Found_genes   = lengths(gene_signatures_found),
+  Missing_genes = vapply(missing_genes, function(x) paste(x, collapse = "; "), character(1)),
+  stringsAsFactors = FALSE
+)
+write.csv(signature_qc, "CD8_signature_gene_QC.csv", row.names = FALSE)
+
+gene_signatures_found = gene_signatures_found[lengths(gene_signatures_found) >= 3]
+set.seed(123)
+
+for (sig_name in names(gene_signatures_found)) {
+  tmp_prefix = paste0(sig_name, "_tmp")
+  CD8_T = AddModuleScore(
+    object   = CD8_T,
+    features = list(gene_signatures_found[[sig_name]]),
+    assay    = "RNA",
+    name     = tmp_prefix,
+    ctrl     = 50,
+    seed     = 123
+  )
+  gen_col = paste0(tmp_prefix, "1")
+  CD8_T@meta.data[[paste0(sig_name, "_Score")]] = CD8_T@meta.data[[gen_col]]
+  CD8_T@meta.data[[gen_col]] = NULL
+}
+
+score_columns = paste0(names(gene_signatures_found), "_Score")
+write.csv(CD8_T@meta.data, "CD8_T_metadata_with_module_scores.csv", row.names = TRUE)
+
+## 8.3 逐鼠平均Module Score汇总与ComplexHeatmap可视化
+score_sample = CD8_T@meta.data %>%
+  tibble::rownames_to_column("Cell") %>%
+  dplyr::select(Cell, orig.ident, Group, dplyr::all_of(score_columns)) %>%
+  dplyr::filter(!is.na(Group)) %>%
+  dplyr::group_by(orig.ident, Group) %>%
+  dplyr::summarise(
+    dplyr::across(dplyr::all_of(score_columns), ~ mean(.x, na.rm = TRUE)),
+    n_cells = dplyr::n(),
+    .groups = "drop"
+  )
+write.csv(score_sample, "CD8_T_score_sample_scores.csv", row.names = FALSE)
+
+heatmap_mat = score_sample %>%
+  dplyr::select(orig.ident, dplyr::all_of(score_columns)) %>%
+  tibble::column_to_rownames("orig.ident") %>%
+  as.matrix()
+colnames(heatmap_mat) = gsub("_Score$", "", colnames(heatmap_mat))
+
+heatmap_z = scale(heatmap_mat)
+heatmap_z[is.na(heatmap_z)] = 0
+
+score_sample_long = score_sample %>%
+  pivot_longer(cols = dplyr::all_of(score_columns), names_to = "Signature", values_to = "Score") %>%
+  mutate(Signature = gsub("_Score$", "", Signature))
+
+stat_df = score_sample_long %>%
+  group_by(Signature) %>%
+  summarise(p = t.test(Score ~ Group)$p.value, .groups = "drop") %>%
+  mutate(
+    sig = case_when(
+      p < 0.001 ~ "***",
+      p < 0.01  ~ "**",
+      p < 0.05  ~ "*",
+      TRUE      ~ "ns"
+    )
+  )
+
+sig_label = stat_df$sig[match(colnames(heatmap_z), stat_df$Signature)]
+sample_annotation = score_sample %>% dplyr::select(orig.ident, Group) %>% dplyr::distinct() %>% tibble::column_to_rownames("orig.ident")
+sample_annotation = sample_annotation[rownames(heatmap_z), , drop = FALSE]
+
+ha_row = rowAnnotation(
+  Group = sample_annotation$Group,
+  col   = list(Group = c("WT" = "#377EB8", "KO" = "#E41A1C")),
+  show_annotation_name = TRUE,
+  annotation_name_gp   = gpar(fontface = "bold")
+)
+
+ha_top = HeatmapAnnotation(
+  Significance = anno_text(sig_label, gp = gpar(fontsize = 12, fontface = "bold"), location = 0.5),
+  show_annotation_name = FALSE
+)
+
+heatmap_col = colorRamp2(c(-2, 0, 2), c("#2166AC", "white", "#B2182B"))
+
+ht = Heatmap(
+  heatmap_z,
+  name             = "Z-score",
+  col              = heatmap_col,
+  top_annotation   = ha_top,
+  left_annotation  = ha_row,
+  cluster_rows     = FALSE,
+  cluster_columns  = TRUE,
+  row_order        = intersect(c("WT_1", "WT_2", "WT_3", "KO_1", "KO_2", "KO_3"), rownames(heatmap_z)),
+  row_names_gp     = gpar(fontsize = 10, fontface = "bold"),
+  column_names_gp  = gpar(fontsize = 10, fontface = "bold"),
+  column_names_rot = 45,
+  border           = TRUE,
+  rect_gp          = gpar(col = "white", lwd = 0.8),
+  column_title     = "CD8 T-cell functional signatures",
+  column_title_gp  = gpar(fontsize = 14, fontface = "bold")
+)
+
+pdf("CD8_T_functional_signatures_Heatmap.pdf", width = 9, height = 5)
+draw(ht, heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+
+## 8.4 CD8+ T细胞功能基因分组DotPlot
+gene_sets = list(
+  Cytotoxic  = c("Nkg7", "Prf1", "Gzmb", "Ifng"),
+  Activation = c("Tbx21", "Cx3cr1", "Eomes", "Klrg1", "Ncr1"),
+  Exhaustion = c("Pdcd1", "Lag3", "Ctla4", "Prdm1", "Havcr2"),
+  Memory     = c("Tcf7", "Slamf6", "Il7r", "Cxcr5", "Lef1")
+)
+
+gene_sets_unique = list()
+used_genes       = character()
+for (set_name in names(gene_sets)) {
+  curr = setdiff(unique(gene_sets[[set_name]]), used_genes)
+  gene_sets_unique[[set_name]] = intersect(curr, rownames(CD8_T))
+  used_genes = c(used_genes, curr)
+}
+
+genes_found = unlist(gene_sets_unique, use.names = FALSE)
+set_sizes   = lengths(gene_sets_unique)
+set_sizes   = set_sizes[set_sizes > 0]
+
+separator_positions = head(cumsum(set_sizes), -1) + 0.5
+set_starts = c(1, head(cumsum(set_sizes), -1) + 1)
+set_ends   = cumsum(set_sizes)
+label_data = data.frame(x = (set_starts + set_ends) / 2, label = gsub("_", " ", names(set_sizes)))
+
+p.CD8.Dot = DotPlot(object = CD8_T, features = genes_found, group.by = "Group", cols = c("grey90", "#B2182B"), dot.scale = 7) +
+  geom_vline(xintercept = separator_positions, linetype = "dashed", color = "grey50") +
+  geom_text(data = label_data, aes(x = x, y = Inf, label = label), inherit.aes = FALSE, vjust = 1.3, fontface = "bold", size = 3.5, color = "grey20") +
+  scale_y_discrete(expand = expansion(mult = c(0.15, 0.35))) +
+  labs(title = "CD8 T Functional Gene Signatures", x = NULL, y = NULL, color = "Average expression", size = "Percent expressed") +
+  RotatedAxis() +
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5, margin = margin(b = 8)),
+    axis.text.x     = element_text(size = 8),
+    legend.position = "right"
+  )
+ggsave(filename = "CD8_T_Functional_Signatures_DotPlot.pdf", plot = p.CD8.Dot, width = 9, height = 4.5)
+saveRDS(CD8_T, file = "klw_cd8_0712.rds")
